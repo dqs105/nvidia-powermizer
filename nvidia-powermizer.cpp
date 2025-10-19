@@ -23,7 +23,7 @@
 
 #include <nvml.h>
 
-#define VERSION "0.1"
+#define VERSION "0.2"
 
 /* Logger */
 typedef enum {
@@ -82,9 +82,10 @@ class PowermizerInstance {
 public:
 	PowermizerInstance(int device_index, bool coder_enabled, 
 		unsigned int boost_util, unsigned int low_power_util, unsigned int boost_time, unsigned int low_power_time) : 
-	index(device_index), en_de_coder_enabled(coder_enabled),
-	boost_utilization(boost_util), low_power_utilization(low_power_util), 
-	boost_activate_time(boost_time), low_power_activate_time(low_power_time) {
+		index(device_index), en_de_coder_enabled(coder_enabled),
+		boost_utilization(boost_util), low_power_utilization(low_power_util), 
+		boost_activate_time(boost_time), low_power_activate_time(low_power_time) {
+
 		nvmlReturn_t result;
 		// Get device handle
 		result = nvmlDeviceGetHandleByIndex(index, &device);
@@ -103,7 +104,16 @@ public:
 			return;
 		}
 
-		log_printf(LOG_INFO, "GPU%d: %s Initializing", index, device_name);
+		// Get PCI info
+		nvmlPciInfo_t pci_info;
+		result = nvmlDeviceGetPciInfo(device, &pci_info);
+		if(result != NVML_SUCCESS) {
+			log_printf(LOG_ERROR, "GPU%d: Failed to get PCI info: %s", index, nvmlErrorString(result));
+			supported = false;
+			return;
+		}
+
+		log_printf(LOG_INFO, "GPU%d: %s (%s) initializing", index, device_name, pci_info.busIdLegacy);
 
 		// Get the max and min memory clocks
 		auto mem_clocks = std::make_unique<unsigned int[]>(10);
@@ -122,17 +132,24 @@ public:
 		}
 
 		// The return value seems to be arranged from max to min
-		low_power_mem_clock = mem_clocks[elements - 1];
+		// Push elements to vector
+		for(unsigned int i = 0; i < elements; i++) {
+			clocks.push_back(mem_clocks[i]);
+		}
+		max_power_state = elements - 1;
 
-		log_printf(LOG_DEBUG, "GPU%d: Selected low power memory clock: %d MHz", index, low_power_mem_clock);
+		log_printf(LOG_DEBUG, "GPU%d: Registered power states: %d", index, elements);
 
-		// Try to reset control
-		result = nvmlDeviceResetMemoryLockedClocks(device);
+		// Try to set to max power state
+		result = nvmlDeviceSetMemoryLockedClocks(device, clocks[0], clocks[0]);
 		if(result != NVML_SUCCESS) {
 			log_printf(LOG_ERROR, "GPU%d: Failed to manipulate clocks: %s", index, nvmlErrorString(result));
 			supported = false;
 			return;
 		}
+
+		// Reset last update time
+		last_update = std::chrono::steady_clock::now();
 
 		log_printf(LOG_DEBUG, "GPU%d: Boost utilization: %d%%", index, boost_utilization);
 		log_printf(LOG_DEBUG, "GPU%d: Low power utilization: %d%%", index, low_power_utilization);
@@ -140,7 +157,7 @@ public:
 		log_printf(LOG_DEBUG, "GPU%d: Low power time: %d ms", index, low_power_activate_time);
 		log_printf(LOG_DEBUG, "GPU%d: Encoder and decoder utilization: %s", index, coder_enabled ? "enabled" : "disabled");
 
-		log_printf(LOG_INFO, "GPU%d: %s initialized", index, device_name);
+		log_printf(LOG_INFO, "GPU%d: %s (%s) initialized", index, device_name, pci_info.busIdLegacy);
 	};
 
 	~PowermizerInstance() {
@@ -194,34 +211,44 @@ public:
 		max_utilization = std::max(utilization.gpu, std::max(encoder_utilization, decoder_utilization));
 
 		// Check if we need to change power state
-		if(low_power_enabled) {
+		// Boost condition
+		if(power_state > 0) {
 			if(max_utilization >= boost_utilization) {
 				// Check if time exceeded
 				auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update);
 				if(duration.count() >= boost_activate_time) {
-					log_printf(LOG_DEBUG, "GPU%d: Boosting power state", index);
-					result = nvmlDeviceResetMemoryLockedClocks(device);
+					int new_clock = clocks[power_state - 1];
+					log_printf(LOG_DEBUG, "GPU%d: Boosting clock to %d", index, new_clock);
+					result = nvmlDeviceSetMemoryLockedClocks(device, new_clock, new_clock);
 					if(result != NVML_SUCCESS) {
 						log_printf(LOG_ERROR, "GPU%d: Failed to reset memory clocks: %s", index, nvmlErrorString(result));
 						return;
 					}
-					low_power_enabled = false;
+					// Update update time
+					last_update = now;
+					power_state--;
 				}
 				// Action has pended or taken, stop processing
 				return;
 			}
-		} else {
+		}
+
+		// Low power condition
+		if(power_state < max_power_state) {
 			if(max_utilization <= low_power_utilization) {
 				// Check if time exceeded
 				auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update);
 				if(duration.count() >= low_power_activate_time) {
-					log_printf(LOG_DEBUG, "GPU%d: Lowering power state", index);
-					result = nvmlDeviceSetMemoryLockedClocks(device, low_power_mem_clock, low_power_mem_clock);
+					int new_clock = clocks[power_state + 1];
+					log_printf(LOG_DEBUG, "GPU%d: Lowering clock to %d", index, new_clock);
+					result = nvmlDeviceSetMemoryLockedClocks(device, new_clock, new_clock);
 					if(result != NVML_SUCCESS) {
 						log_printf(LOG_ERROR, "GPU%d: Failed to set memory clocks: %s", index, nvmlErrorString(result));
 						return;
 					}
-					low_power_enabled = true;
+					// Update update time
+					last_update = now;
+					power_state++;
 				}
 				// Action has pended or taken, stop processing
 				return;
@@ -233,10 +260,6 @@ public:
 		last_update = now;
 	}
 
-	void print_utilization() {
-		log_printf(LOG_DEBUG, "GPU%d: Utilization: %d%%", index, max_utilization);
-	}
-
 private:
 	// Target device handle
 	nvmlDevice_t device;
@@ -244,15 +267,16 @@ private:
 
 	// Config vars
 	bool en_de_coder_enabled;
-	unsigned int low_power_mem_clock;
 	unsigned int boost_utilization;
 	unsigned int low_power_utilization;
 	unsigned int boost_activate_time;
 	unsigned int low_power_activate_time;
+	std::vector<int> clocks = {};
 	bool supported = true;
 
 	// Process vars
-	bool low_power_enabled = false;
+	int power_state = 0;
+	int max_power_state = 0;
 	unsigned int max_utilization;
 	std::chrono::steady_clock::time_point last_update;
 };
@@ -425,6 +449,18 @@ int main(int argc, char *argv[]) {
 
 	log_printf(LOG_INFO, "Exiting");
 
-	// Object destruction will be handled gracefully
+	for(auto &instance : instances) {
+		instance.reset();
+	}
+
+	// Shutdown NVML
+	log_printf(LOG_DEBUG, "Shutting down NVML");
+
+	result = nvmlShutdown();
+	if(result != NVML_SUCCESS) {
+		log_printf(LOG_ERROR, "Failed to shutdown NVML: %s", nvmlErrorString(result));
+		return 1;
+	}
+	
 	return 0;
 }

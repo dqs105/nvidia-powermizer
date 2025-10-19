@@ -7,15 +7,6 @@ CXXFLAGS = -Wall -g -O2
 # Linker flags
 LDFLAGS = -lnvidia-ml
 
-# Source files
-SRCS = nvidia-powermizer.cpp
-
-# Object files
-OBJS = $(SRCS:.cpp=.o)
-
-# Executable name
-TARGET = nvidia-powermizer
-
 # Default target
 all: nvidia-powermizer
 
